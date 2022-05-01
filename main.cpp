@@ -10,6 +10,7 @@
 #include "hardware/pwm.h"
 #include "hardware/irq.h"
 #include "ssd1306.h"
+#include "include/distortion_map.h"
 #include "pico-ssd1306/textRenderer/TextRenderer.h"
 #include "pico-ssd1306/textRenderer/8x8_font.h"
 
@@ -25,8 +26,8 @@
 
 // LED pin numbers
 #define CLIP_LED 2
-#define OUTPUT_LED 3
-#define PLAY_LED 4
+#define OUTPUT_LED 4
+#define PLAY_LED 3
 #define ONBOARD_LED  25
 
 // Button pin numbers
@@ -45,8 +46,24 @@
 
 #define PROGRAM_VERSION "v30_04_22"
 
+// Prototypes
+bool timer_callback(struct repeating_timer *t);
 
+/* ================================================================================
+~
+~   ______ _     _             _   _             
+~   |  _  (_)   | |           | | (_)            
+~   | | | |_ ___| |_ ___  _ __| |_ _  ___  _ __  
+~   | | | | / __| __/ _ \| '__| __| |/ _ \| '_ \ 
+~   | |/ /| \__ \ || (_) | |  | |_| | (_) | | | |
+~   |___/ |_|___/\__\___/|_|   \__|_|\___/|_| |_|
+~                                                
+~   
+================================================================================= */
 
+uint16_t distortion_enabled = 0;
+uint16_t *selected_distortion_map = distortion_map_down;
+uint16_t previous_sample_raw = 0;
 
 /* =================================================================================
 ~ 
@@ -90,7 +107,7 @@ sample_buffer input_buffer = {DELAY_BUFFER_SIZE,0,0,input_buffer_data}; // Input
 int16_t output_buffer_data [DELAY_BUFFER_SIZE];     // Actual output buffer data
 sample_buffer output_buffer = {DELAY_BUFFER_SIZE, 0, 0, output_buffer_data}; // Output buffer wrapper
 
-
+uint16_t delay_enabled = 0;
 
 
 
@@ -111,6 +128,8 @@ uint16_t delay_sample_count = 22000;
 uint16_t delayed_value = 0;
 int32_t temp_val;
 
+uint16_t adc_raw;
+
 uint16_t delay_repeat = 1;
 uint16_t address = 0;
 
@@ -119,7 +138,8 @@ uint slice;
 uint channel;
 uint pwm_callbacks;
 
-
+// Create timer object
+struct repeating_timer timer;      
 
 
 
@@ -136,6 +156,8 @@ uint pwm_callbacks;
 ~ .
 ============================================================================================ */
 
+// Unused
+// Return modulo count both up and down, by certain increment
 uint16_t wrap_count(uint16_t count, int32_t increment,uint16_t wrap)
 {
     return (count + wrap + increment) % wrap;
@@ -180,9 +202,9 @@ struct modifiable_variable              // Structure to store all parameters of 
 // All variables available to modify
 modifiable_variable modifiable_variables [NO_MODIFIABLE_VARIABLES]=
 {
+    {"Distortion", &distortion_enabled, 0,1,1},
     {"Length",&delay_sample_count,2000,45000,1000},
-    {"Repeat",&delay_repeat,0,10,1},
-    {"Sepeat",&delay_repeat,0,10,1},
+    {"Delay EN",&delay_enabled,0,1,1},
     {"Tepeat",&delay_repeat,0,10,1},
     {"Uepeat",&delay_repeat,0,10,1},
     {"Vepeat",&delay_repeat,0,10,1},
@@ -214,9 +236,38 @@ void irq_button_callback()
     switch (gpio_values)    // Determine which button was pressed
     {
 
-    case BUTTON_CENTRE_PRESSED:
+    case BUTTON_CENTRE_PRESSED:         // Resync input and output buffers
+        
+        // Disable entire PWM system
+        pwm_set_irq_enabled(slice,false);
+        irq_set_enabled(PWM_IRQ_WRAP,false);
+        pwm_set_enabled(slice,false);
 
-        printf("Centre button pressed\n");
+        // Disable A to D timer
+        cancel_repeating_timer(&timer);
+        
+        // Empty buffers
+        clear_sample_buffer(&input_buffer,0);
+        clear_sample_buffer(&output_buffer,0);
+
+        // Reset buffer positions
+        input_buffer.in_count = 0;
+        input_buffer.out_count = 0;
+        output_buffer.in_count = 0;
+        output_buffer.out_count = 0;
+        
+        // Re-enable A to D timer
+        add_repeating_timer_us(-22,timer_callback,NULL,&timer);
+
+        // Reset PWM counter
+        pwm_set_counter(slice,0);
+
+         // Renable PWM system
+        pwm_set_irq_enabled(slice,true);
+        irq_set_enabled(PWM_IRQ_WRAP,true);
+        pwm_set_enabled(slice,true);
+
+        
         gpio_acknowledge_irq(BUTTON_CENTRE,GPIO_IRQ_EDGE_RISE); // Acknowledge interrupt
         
         break;
@@ -342,23 +393,66 @@ bool timer_callback(struct repeating_timer *t)
 {
     
     // Get input from A -> D
-    uint16_t adc_raw;
+    previous_sample_raw = adc_raw;
     adc_raw = adc_read(); 
+    uint16_t temp_sample = adc_raw;
 
-    // Convert to signed integer and place in buffer
-    input_buffer.contents[input_buffer.in_count] = adc_raw - 2048;
-    // Increment buffer position
-    input_buffer.in_count = (input_buffer.in_count +1) % input_buffer.size;
+    
     
     // Turn on output LED if value in range
     if (adc_raw > 3000 || adc_raw < 1000)
     {
         gpio_pull_up(OUTPUT_LED);
+        if (adc_raw > 3900 || adc_raw < 140)
+        {gpio_pull_up(CLIP_LED);}
+        else
+        {gpio_pull_down(CLIP_LED);}
     }
     else
     {
         gpio_pull_down(OUTPUT_LED);
     }
+
+    if (distortion_enabled)
+    {
+        if (adc_raw > previous_sample_raw)
+        {
+            selected_distortion_map = distortion_map_up;
+        } 
+        else
+        {
+            selected_distortion_map = distortion_map_down;
+        }
+
+        temp_sample = selected_distortion_map[temp_sample];
+        
+    }
+
+    // Convert to signed integer and place in buffer
+    input_buffer.contents[input_buffer.in_count] = temp_sample - 2048;
+    // Increment buffer position
+    input_buffer.in_count = (input_buffer.in_count +1) % input_buffer.size;
+
+
+    if (input_buffer.in_count != input_buffer.out_count)    // So in theory this should keep the input and
+                                                                // output buffers in sync, apparently it doesnt
+       {
+           //printf("s2\n");
+            if (delay_enabled)
+            {
+                delayed_value = (input_buffer.out_count - delay_sample_count + input_buffer.size ) % input_buffer.size;
+                temp_val = input_buffer.contents[input_buffer.out_count] * 0.5;
+                temp_val += input_buffer.contents[delayed_value] * 0.5;
+            }
+            else
+            {
+                temp_val = input_buffer.contents[input_buffer.out_count];
+            }
+
+            output_buffer.contents[output_buffer.in_count] = temp_val ;
+            input_buffer.out_count = (input_buffer.out_count + 1) % input_buffer.size;
+            output_buffer.in_count = input_buffer.in_count;
+        }
 
     return true;
 }
@@ -376,13 +470,23 @@ bool timer_callback(struct repeating_timer *t)
 ~ .
 ======================================================================= */
 
+#define PWM_PERIOD 1374
+
 void pwm_interrupt_callback()
 {
-
-    level = ((output_buffer.contents[output_buffer.out_count] + 2048) >> 2) + 175;
-    pwm_set_gpio_level(PWM_PIN,level);
-    output_buffer.out_count++;
     pwm_clear_irq(slice);
+    if (output_buffer.out_count != output_buffer.in_count)
+    {
+        level = ((output_buffer.contents[output_buffer.out_count] + 2048) >> 2) + 175;
+        pwm_set_gpio_level(PWM_PIN,level);
+        output_buffer.out_count = (output_buffer.out_count + 1) % output_buffer.size;
+    }
+    
+
+    
+    return;
+
+    
 
 }
 
@@ -501,8 +605,7 @@ int main() {
     adc_gpio_init( ADC_PIN);
     adc_select_input( 0);
 
-    // Create timer object
-    struct repeating_timer timer;      
+
 
     /* -----------------------------------------
 ~      _____      ____  __   ___      _ _   
@@ -519,10 +622,9 @@ int main() {
 
     // Setup PWM for audio output
     pwm_config config = pwm_get_default_config();
-    pwm_config_set_wrap(&config, 1375); 
+    pwm_config_set_wrap(&config, PWM_PERIOD); 
     pwm_config_set_phase_correct(&config,true);
     pwm_init(slice, &config, true);
-    pwm_set_enabled(slice,true);
     pwm_set_gpio_level(PWM_PIN, 1375);
 
     // Start timer, every 22us, call timer_callback, pass it struct of addresses,
@@ -535,11 +637,14 @@ int main() {
     gpio_pull_up(PLAY_LED);
 
 
+
+
     add_repeating_timer_us(-22,timer_callback,NULL,&timer);  
     sleep_us(10);
     pwm_set_irq_enabled(slice,true);
     irq_set_exclusive_handler(PWM_IRQ_WRAP,pwm_interrupt_callback);
     irq_set_enabled(PWM_IRQ_WRAP,true);
+    pwm_set_enabled(slice,true);
 
     // Force button interrupt to update screen
     irq_button_callback();
@@ -569,17 +674,11 @@ int main() {
     while (true)
     {
 
-        if (input_buffer.in_count != input_buffer.out_count)    // So in theory this should keep the input and
-                                                                // output buffers in sync, apparently it doesnt
-        {
-            delayed_value = (input_buffer.out_count - delay_sample_count + input_buffer.size ) % input_buffer.size;
-            temp_val = input_buffer.contents[input_buffer.out_count] * 0.5;
-            temp_val += input_buffer.contents[delayed_value] * 0.5;
-            output_buffer.contents[output_buffer.in_count] = temp_val ;
-            input_buffer.out_count = (input_buffer.out_count + 1) % input_buffer.size;
-            output_buffer.in_count = input_buffer.in_count;
-        }
+        // whole load of nothing here;
+        tight_loop_contents(); // noop
+
 
 
     }
+    
 }
