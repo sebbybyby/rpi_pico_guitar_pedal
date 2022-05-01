@@ -5,14 +5,17 @@
  */
 
 #include "pico/stdlib.h"
+#include "pico/bootrom.h"
 #include <stdio.h>
 #include "hardware/adc.h"
 #include "hardware/pwm.h"
 #include "hardware/irq.h"
+#include "hardware/watchdog.h"
 #include "ssd1306.h"
 #include "include/distortion_map.h"
 #include "pico-ssd1306/textRenderer/TextRenderer.h"
 #include "pico-ssd1306/textRenderer/8x8_font.h"
+#include "pico/float.h"
 
 // ADC and PWM pin numbers
 #define ADC_PIN 26          // Input AtoD pin
@@ -44,26 +47,19 @@
 #define BUTTON_DOWN_PRESSED 0x100
 #define BUTTON_CENTRE_PRESSED 0x40
 
-#define PROGRAM_VERSION "v30_04_22"
+
+#define GPIO_BUTTON_MASK 0x3E0
+#define PROGRAM_VERSION "v01_05_22"
+
+// Priority flags for RP2040 interrupts
+#define IRQ_LOW_PRIORITY 0xc0
+#define IRQ_DEFAULT_PRIORITY 0x80
+#define IRQ_HIGH_PRIORITY 0x40
+#define IRQ_MAX_PRIORITY 0x00
 
 // Prototypes
 bool timer_callback(struct repeating_timer *t);
-
-/* ================================================================================
-~
-~   ______ _     _             _   _             
-~   |  _  (_)   | |           | | (_)            
-~   | | | |_ ___| |_ ___  _ __| |_ _  ___  _ __  
-~   | | | | / __| __/ _ \| '__| __| |/ _ \| '_ \ 
-~   | |/ /| \__ \ || (_) | |  | |_| | (_) | | | |
-~   |___/ |_|___/\__\___/|_|   \__|_|\___/|_| |_|
-~                                                
-~   
-================================================================================= */
-
-uint16_t distortion_enabled = 0;
-uint16_t *selected_distortion_map = distortion_map_down;
-uint16_t previous_sample_raw = 0;
+struct sample_buffer;
 
 /* =================================================================================
 ~ 
@@ -91,23 +87,11 @@ struct sample_buffer {
 // Function to fill buffer with specified value val
 void clear_sample_buffer(sample_buffer* buff,uint16_t val)
 {
-    for (uint32_t i = 0; i <buff->size; i++)
+    for (uint32_t i = 0; i < buff->size; i++)
     {
         buff->contents[i] = val;
     }
 }
-
-#define DELAY_BUFFER_SIZE 47000     
-
-// Delay input buffer
-int16_t input_buffer_data[DELAY_BUFFER_SIZE];       // Actual input buffer data
-sample_buffer input_buffer = {DELAY_BUFFER_SIZE,0,0,input_buffer_data}; // Input buffer wrapper
-
-// Delay output buffer
-int16_t output_buffer_data [DELAY_BUFFER_SIZE];     // Actual output buffer data
-sample_buffer output_buffer = {DELAY_BUFFER_SIZE, 0, 0, output_buffer_data}; // Output buffer wrapper
-
-uint16_t delay_enabled = 0;
 
 
 
@@ -124,22 +108,130 @@ uint16_t delay_enabled = 0;
 ~                                                                                       
 ============================================================================================== */
 
-uint16_t delay_sample_count = 22000;
-uint16_t delayed_value = 0;
+
+
+
+
+float calculated_distortion_amplitude = 1;
+float calculated_distortion_dry_amplitude = 0;
+float calculated_pre_delay_amplitude = 1;
+float calculated_delay_amplitude = 0.5;
+float calculated_IIR_amplitude = 0.3;
+
+uint16_t reboot_to_bootlader = 0;
 int32_t temp_val;
 
 uint16_t adc_raw;
-
-uint16_t delay_repeat = 1;
-uint16_t address = 0;
 
 uint16_t level = 688;
 uint slice;
 uint channel;
 uint pwm_callbacks;
 
+
+
 // Create timer object
 struct repeating_timer timer;      
+
+/* ================================================================================
+~
+~   ______ _     _             _   _             
+~   |  _  (_)   | |           | | (_)            
+~   | | | |_ ___| |_ ___  _ __| |_ _  ___  _ __  
+~   | | | | / __| __/ _ \| '__| __| |/ _ \| '_ \ 
+~   | |/ /| \__ \ || (_) | |  | |_| | (_) | | | |
+~   |___/ |_|___/\__\___/|_|   \__|_|\___/|_| |_|
+~                                                
+~   
+================================================================================= */
+
+uint16_t distortion_enabled = 0;
+uint16_t *selected_distortion_map = distortion_map_down;
+uint16_t previous_sample_raw = 0;
+uint16_t distortion_mask = 0xffff;
+uint16_t distortion_mix = 100;
+uint16_t pre_delay_amplitude = 100;
+
+
+
+/* ================================================================================
+~   
+~   ______        _               
+~   |  _  \      | |              
+~   | | | |  ___ | |  __ _  _   _ 
+~   | | | | / _ \| | / _` || | | |
+~   | |/ / |  __/| || (_| || |_| |
+~   |___/   \___||_| \__,_| \__, |
+~                            __/ |
+~                           |___/ 
+~ .
+================================================================================= */
+
+#define DELAY_BUFFER_SIZE 47000     
+
+uint16_t delay_sample_count = 22000;
+uint16_t delayed_value = 0;
+
+
+uint16_t delay_amplitude = 50;
+uint16_t IIR_enabled = 0;
+uint16_t IIR_amplitude = 10;
+
+// Delay input buffer
+int16_t input_buffer_data[DELAY_BUFFER_SIZE];       // Actual input buffer data
+sample_buffer input_buffer = {DELAY_BUFFER_SIZE,0,0,input_buffer_data}; // Input buffer wrapper
+
+// Delay output buffer
+int16_t output_buffer_data [DELAY_BUFFER_SIZE];     // Actual output buffer data
+sample_buffer output_buffer = {DELAY_BUFFER_SIZE, 0, 0, output_buffer_data}; // Output buffer wrapper
+
+uint16_t delay_enabled = 0;
+
+sample_buffer* current_sample_buffer_to_input_from = &input_buffer;
+float current_delay_amplitude = calculated_delay_amplitude;
+
+
+
+/* ================================================================================
+~
+~   ______  _                                  
+~   |  ___|| |                                 
+~   | |_   | |  __ _  _ __    __ _   ___  _ __ 
+~   |  _|  | | / _` || '_ \  / _` | / _ \| '__|
+~   | |    | || (_| || | | || (_| ||  __/| |   
+~   \_|    |_| \__,_||_| |_| \__, | \___||_|   
+~                             __/ |            
+~                            |___/             
+~  .                        
+================================================================================= */
+
+uint16_t flanger_enabled = 0;
+uint16_t flanger_min_delay = 0;
+uint16_t flanger_max_delay = 2000;
+uint16_t flanger_period = 1000;
+uint32_t flanger_increment_period = 1000;
+
+bool flanger_climbing = true;
+
+repeating_timer flanger_timer;
+
+bool update_flanger_delay(struct repeating_timer *t)
+{
+    if (flanger_climbing)
+    {
+        delay_sample_count ++;
+    }
+    else
+    {
+        delay_sample_count --;
+    }
+    if(delay_sample_count <= flanger_min_delay || delay_sample_count >= flanger_max_delay)
+    {
+        flanger_climbing = !(flanger_climbing);
+    }
+    return true;
+}
+
 
 
 
@@ -165,9 +257,6 @@ uint16_t wrap_count(uint16_t count, int32_t increment,uint16_t wrap)
 
 
 
-
-
-
 /* ===============================================================================================
 ~
 ~______  _              _                     __  _____                _                 _ 
@@ -183,7 +272,7 @@ uint16_t wrap_count(uint16_t count, int32_t increment,uint16_t wrap)
 
 //i2c screen software defines
 #define NO_VARIABLES_ON_SCREEN 7        // Max number of variables on screen
-#define NO_MODIFIABLE_VARIABLES 10      // Number of variables available to modify
+#define NO_MODIFIABLE_VARIABLES 15      // Number of variables available to modify
 #define CURRENT_VARIABLE modifiable_variables[selected_variable]    // Quick access to current selected variable
 #define CURRENT_VALUE *(modifiable_variables[selected_variable].variable_address)   // Quick access to its value
 
@@ -197,21 +286,27 @@ struct modifiable_variable              // Structure to store all parameters of 
     uint16_t min;                       // Minimum value
     uint16_t max;                       // Maximum value
     uint16_t step;                      // Step size
+    bool read_only;
 };
 
 // All variables available to modify
 modifiable_variable modifiable_variables [NO_MODIFIABLE_VARIABLES]=
 {
-    {"Distortion", &distortion_enabled, 0,1,1},
-    {"Length",&delay_sample_count,2000,45000,1000},
-    {"Delay EN",&delay_enabled,0,1,1},
-    {"Tepeat",&delay_repeat,0,10,1},
-    {"Uepeat",&delay_repeat,0,10,1},
-    {"Vepeat",&delay_repeat,0,10,1},
-    {"Wepeat",&delay_repeat,0,10,1},
-    {"Var",(uint16_t*)&selected_variable,0,10,1},
-    {"addr",&address,0,64000,1},
-    {"crash",(uint16_t*)address,0,64000,1}
+    {"Distortion", &distortion_enabled, 0,1,1,false},
+    {"Dst.Mix",&distortion_mix,0,100,10,false},
+    {"Dst.Mask",&distortion_mask,0xff00,0xffff,0xff,false},
+    {"PrDly Amp",&pre_delay_amplitude,0,100,10,false},
+    {"Dly EN",&delay_enabled,0,1,1,false},
+    {"Dly Len",&delay_sample_count,2000,45000,1000,false},
+    {"Dly Amp",&delay_amplitude,0,100,10,false},
+    {"IIR EN",&IIR_enabled,0,1,1,false},
+    {"IIR Amp",&IIR_amplitude,0,80,10,false},
+    {"Flngr EN",&flanger_enabled,0,1,1,false},
+    {"Min FDly",&flanger_min_delay,0,3000,100,false},
+    {"Max FDly",&flanger_max_delay,0,8000,100,false},
+    {"FlngPrd.",&flanger_period,100,4000,100,false},
+    {"FIncPrd",(uint16_t*)&flanger_increment_period,0,0,0,true},
+    {"Update",&reboot_to_bootlader,0,1,1,false}
 };
 
 
@@ -231,7 +326,7 @@ void irq_button_callback()
    ------------------------------------------------------------------ */
 
     // Get value of all digital gpio pins
-    uint32_t gpio_values = gpio_get_all() & 0x3E0;
+    uint32_t gpio_values = gpio_get_all() & GPIO_BUTTON_MASK;
 
     switch (gpio_values)    // Determine which button was pressed
     {
@@ -245,6 +340,7 @@ void irq_button_callback()
 
         // Disable A to D timer
         cancel_repeating_timer(&timer);
+        cancel_repeating_timer(&flanger_timer);
         
         // Empty buffers
         clear_sample_buffer(&input_buffer,0);
@@ -255,6 +351,30 @@ void irq_button_callback()
         input_buffer.out_count = 0;
         output_buffer.in_count = 0;
         output_buffer.out_count = 0;
+
+        if (flanger_enabled)
+        {
+            if (flanger_max_delay > flanger_min_delay)
+            {
+                modifiable_variables[2].read_only = true;
+                modifiable_variables[3].read_only = true;
+                delay_sample_count = flanger_min_delay;
+                flanger_climbing = true;
+                flanger_increment_period = (flanger_period * 500) / (flanger_max_delay - flanger_min_delay + 1);
+                add_repeating_timer_us(-1*flanger_increment_period,update_flanger_delay,NULL,&flanger_timer);
+            }
+            else
+            {
+                modifiable_variables[2].read_only = false;
+                modifiable_variables[3].read_only = false;
+                flanger_enabled = false;
+            }
+        }
+        else
+        {
+            modifiable_variables[2].read_only = false;
+            modifiable_variables[3].read_only = false;
+        }
         
         // Re-enable A to D timer
         add_repeating_timer_us(-22,timer_callback,NULL,&timer);
@@ -275,7 +395,8 @@ void irq_button_callback()
     case BUTTON_LEFT_PRESSED:
 
         printf("Left button pressed\n");
-        CURRENT_VALUE -= CURRENT_VARIABLE.step; // Decrease selected variable by its step
+        if (!CURRENT_VARIABLE.read_only)
+            CURRENT_VALUE -= CURRENT_VARIABLE.step; // Decrease selected variable by its step
         gpio_acknowledge_irq(BUTTON_LEFT,GPIO_IRQ_EDGE_RISE); // Acknowledge interrupt
         
         break;
@@ -283,7 +404,8 @@ void irq_button_callback()
     case BUTTON_RIGHT_PRESSED:
 
         printf("Right button pressed\n");
-        CURRENT_VALUE += CURRENT_VARIABLE.step; // Increase selected variable by its step
+        if (!CURRENT_VARIABLE.read_only)
+            CURRENT_VALUE += CURRENT_VARIABLE.step; // Increase selected variable by its step
         gpio_acknowledge_irq(BUTTON_RIGHT,GPIO_IRQ_EDGE_RISE); // Acknowledge interrupt
         
         break;
@@ -335,8 +457,41 @@ void irq_button_callback()
     }
 
     // Ensure selected variable is within range
-    if ( CURRENT_VALUE > CURRENT_VARIABLE.max) {CURRENT_VALUE = CURRENT_VARIABLE.max;}
-    else if (CURRENT_VALUE < CURRENT_VARIABLE.min) {CURRENT_VALUE = CURRENT_VARIABLE.min;}
+    if (!CURRENT_VARIABLE.read_only)
+    {
+        if ( CURRENT_VALUE > CURRENT_VARIABLE.max) {CURRENT_VALUE = CURRENT_VARIABLE.max;}
+        else if (CURRENT_VALUE < CURRENT_VARIABLE.min) {CURRENT_VALUE = CURRENT_VARIABLE.min;}
+    }
+
+    if (reboot_to_bootlader) 
+    {
+        display.clear();
+        pico_ssd1306::drawText(&display,font_8x8,"Ready to update...",4,32);
+        display.sendBuffer();
+        irq_set_mask_enabled(0x1F,false);
+        reset_usb_boot(1<<OUTPUT_LED,0); // reset to bootloader mode
+        while (1)
+        {}
+    }    
+
+    calculated_distortion_amplitude = distortion_mix * 0.01;
+    calculated_distortion_dry_amplitude = 1 - calculated_distortion_amplitude;
+    calculated_pre_delay_amplitude = pre_delay_amplitude * 0.01;
+    calculated_delay_amplitude = delay_amplitude * 0.01;
+    calculated_IIR_amplitude = IIR_amplitude * 0.01;
+
+
+    if (IIR_enabled)
+    {
+        current_sample_buffer_to_input_from = &output_buffer;
+        current_delay_amplitude = calculated_IIR_amplitude;
+    }
+    else
+    {
+        current_sample_buffer_to_input_from = &input_buffer;
+        current_delay_amplitude = calculated_delay_amplitude;
+    }
+
 
     /* --------------------------------------------------------------
 ~      _   _          _      _         ___  _         _           
@@ -356,7 +511,13 @@ void irq_button_callback()
         selected = ' '; // Default -> no highlight
 
         // Highlight if selected
-        if (i + variable_display_offset == selected_variable) {selected = 'o';}
+        if (i + variable_display_offset == selected_variable) 
+        {
+            if (modifiable_variables[i+variable_display_offset].read_only) 
+                selected = 'x'; 
+            else 
+                selected = 'o';
+        }
         
         // Format <highlight character> <variable name> <value>
         sprintf(temp_string,"%c %s %d",selected,modifiable_variables[i + variable_display_offset].name,*(modifiable_variables[i+variable_display_offset].variable_address));
@@ -396,9 +557,10 @@ bool timer_callback(struct repeating_timer *t)
     previous_sample_raw = adc_raw;
     adc_raw = adc_read(); 
     uint16_t temp_sample = adc_raw;
+    uint16_t distorted_sample;
 
-    
-    
+
+
     // Turn on output LED if value in range
     if (adc_raw > 3000 || adc_raw < 1000)
     {
@@ -413,19 +575,35 @@ bool timer_callback(struct repeating_timer *t)
         gpio_pull_down(OUTPUT_LED);
     }
 
+    /* ----------------------------------------------
+    ~  ___  _    _           _   _          
+    ~ |   \(_)__| |_ ___ _ _| |_(_)___ _ _  
+    ~ | |) | (_-<  _/ _ \ '_|  _| / _ \ ' \ 
+    ~ |___/|_/__/\__\___/_|  \__|_\___/_||_|
+                                       
+    ------------------------------------------------ */
+
+
     if (distortion_enabled)
     {
-        if (adc_raw > previous_sample_raw)
+        if ((adc_raw & distortion_mask) > (previous_sample_raw & distortion_mask))
         {
             selected_distortion_map = distortion_map_up;
         } 
-        else
+        else if ((adc_raw & distortion_mask) < (previous_sample_raw& distortion_mask))
         {
             selected_distortion_map = distortion_map_down;
         }
 
-        temp_sample = selected_distortion_map[temp_sample];
+        //temp_sample = (temp_sample*calculated_distortion_dry_amplitude)+(selected_distortion_map[temp_sample]*calculated_distortion_amplitude);
+        distorted_sample = selected_distortion_map[temp_sample] * calculated_distortion_amplitude;
+        temp_sample = temp_sample * calculated_distortion_dry_amplitude;
+        //tight_loop_contents();
+        temp_sample += distorted_sample;
+
+
         
+        //temp_sample = selected_distortion_map[temp_sample];
     }
 
     // Convert to signed integer and place in buffer
@@ -433,16 +611,23 @@ bool timer_callback(struct repeating_timer *t)
     // Increment buffer position
     input_buffer.in_count = (input_buffer.in_count +1) % input_buffer.size;
 
+    /* ------------------------------------------------------------
+     ~  ___      _               __  ___ _                        
+     ~ |   \ ___| |__ _ _  _    / / | __| |__ _ _ _  __ _ ___ _ _ 
+     ~ | |) / -_) / _` | || |  / /  | _|| / _` | ' \/ _` / -_) '_|
+     ~ |___/\___|_\__,_|\_, | /_/   |_| |_\__,_|_||_\__, \___|_|  
+     ~                  |__/                        |___/         
+     ----------------------------------------------------------- */
 
-    if (input_buffer.in_count != input_buffer.out_count)    // So in theory this should keep the input and
+    //if (input_buffer.in_count != input_buffer.out_count)    // So in theory this should keep the input and
                                                                 // output buffers in sync, apparently it doesnt
-       {
-           //printf("s2\n");
+    //   {
             if (delay_enabled)
             {
                 delayed_value = (input_buffer.out_count - delay_sample_count + input_buffer.size ) % input_buffer.size;
-                temp_val = input_buffer.contents[input_buffer.out_count] * 0.5;
-                temp_val += input_buffer.contents[delayed_value] * 0.5;
+                temp_val = input_buffer.contents[input_buffer.out_count] * calculated_pre_delay_amplitude;
+                temp_val += current_sample_buffer_to_input_from->contents[delayed_value] *  current_delay_amplitude;
+
             }
             else
             {
@@ -452,10 +637,12 @@ bool timer_callback(struct repeating_timer *t)
             output_buffer.contents[output_buffer.in_count] = temp_val ;
             input_buffer.out_count = (input_buffer.out_count + 1) % input_buffer.size;
             output_buffer.in_count = input_buffer.in_count;
-        }
+    //    }
+
 
     return true;
 }
+
 
 /* =======================================================================
 ~
@@ -481,8 +668,6 @@ void pwm_interrupt_callback()
         pwm_set_gpio_level(PWM_PIN,level);
         output_buffer.out_count = (output_buffer.out_count + 1) % output_buffer.size;
     }
-    
-
     
     return;
 
@@ -556,7 +741,7 @@ int main() {
 
     // Instanciate display object
     display = pico_ssd1306::SSD1306(I2C_PORT, I2C_SCREEN_ADDRESS, pico_ssd1306::Size::W128xH64);
-    sleep_ms(1000);
+    sleep_ms(500);
     display.clear();
 
     
@@ -568,6 +753,38 @@ int main() {
                                               
     -------------------------------------------- */
 
+    if (watchdog_caused_reboot())
+    {
+        if (watchdog_enable_caused_reboot())
+        {
+        display.invertDisplay();
+        display.clear();
+        pico_ssd1306::drawText(&display,font_12x16,"Uh oh..",0,0);
+        pico_ssd1306::drawText(&display,font_8x8,"oopsie happend",0,16);
+        pico_ssd1306::drawText(&display,font_8x8,"centre to cont.",0,32);
+        display.sendBuffer();
+
+
+        uint32_t gpio_values = 0;
+        while (gpio_values != BUTTON_CENTRE_PRESSED)
+        {
+            gpio_values = gpio_get_all() & GPIO_BUTTON_MASK;
+        }
+        display.invertDisplay();
+        display.clear();
+        }
+        else
+        {
+            display.clear();
+            pico_ssd1306::drawText(&display,font_12x16,"Update",0,0);
+            pico_ssd1306::drawText(&display,font_8x8,"was successful!",0,16);
+            display.sendBuffer();
+            sleep_ms(1000);
+            display.clear();
+        }
+
+    }
+
     // Print setup to screen
     pico_ssd1306::drawText(&display,font_12x16,"FX Pedal",0,0);
     pico_ssd1306::drawText(&display,font_8x8,PROGRAM_VERSION,0,16);
@@ -578,7 +795,7 @@ int main() {
     gpio_put(ONBOARD_LED,1);
     
     // Have a break
-    sleep_ms(5000);
+    sleep_ms(1000);
 
     // Print debug info to serial
     printf("--------------------------------------\n");
@@ -587,6 +804,8 @@ int main() {
     printf("Phase correct pwm \n");
     printf("PWM SLICE: %d\n",slice);
     printf("PWM CHANNEL: %d\n",channel);
+
+
 
     // Have a kit-kat
     sleep_ms(1000);
@@ -655,7 +874,8 @@ int main() {
     gpio_set_irq_enabled_with_callback(BUTTON_DOWN, GPIO_IRQ_EDGE_RISE, true, (gpio_irq_callback_t)&irq_button_callback);
     gpio_set_irq_enabled_with_callback(BUTTON_RIGHT, GPIO_IRQ_EDGE_RISE, true, (gpio_irq_callback_t)&irq_button_callback);
     gpio_set_irq_enabled_with_callback(BUTTON_LEFT, GPIO_IRQ_EDGE_RISE, true, (gpio_irq_callback_t)&irq_button_callback);
-
+    watchdog_enable(100,1);
+    
 
 /* -----------------------------------------------------------------
 ~
@@ -675,8 +895,7 @@ int main() {
     {
 
         // whole load of nothing here;
-        tight_loop_contents(); // noop
-
+        watchdog_update();
 
 
     }
