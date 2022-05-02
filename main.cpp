@@ -108,17 +108,19 @@ void clear_sample_buffer(sample_buffer* buff,uint16_t val)
 ~                                                                                       
 ============================================================================================== */
 
+uint32_t time_ended;
+uint32_t time_started;
+int32_t time_taken;
+int32_t output_volume = 127;
 
 
+//float calculated_distortion_amplitude = 1;
+//float calculated_distortion_dry_amplitude = 0;
+//float calculated_pre_delay_amplitude = 1;
+//float calculated_delay_amplitude = 0.5;
+//float calculated_IIR_amplitude = 0.3;
 
-
-float calculated_distortion_amplitude = 1;
-float calculated_distortion_dry_amplitude = 0;
-float calculated_pre_delay_amplitude = 1;
-float calculated_delay_amplitude = 0.5;
-float calculated_IIR_amplitude = 0.3;
-
-uint16_t reboot_to_bootlader = 0;
+int32_t reboot_to_bootlader = 0;
 int32_t temp_val;
 
 uint16_t adc_raw;
@@ -127,6 +129,10 @@ uint16_t level = 688;
 uint slice;
 uint channel;
 uint pwm_callbacks;
+uint16_t distortion_dry_amplitude = 0;
+
+uint32_t temp_sample;
+uint32_t temp_distorted_sample;
 
 
 
@@ -145,12 +151,12 @@ struct repeating_timer timer;
 ~   
 ================================================================================= */
 
-uint16_t distortion_enabled = 0;
+int32_t distortion_enabled = 0;
 uint16_t *selected_distortion_map = distortion_map_down;
 uint16_t previous_sample_raw = 0;
-uint16_t distortion_mask = 0xffff;
-uint16_t distortion_mix = 100;
-uint16_t pre_delay_amplitude = 100;
+int32_t distortion_mask = 0xffff;
+int32_t distortion_mix = 100;
+int32_t pre_delay_amplitude = 100;
 
 
 
@@ -169,13 +175,13 @@ uint16_t pre_delay_amplitude = 100;
 
 #define DELAY_BUFFER_SIZE 47000     
 
-uint16_t delay_sample_count = 22000;
+int32_t delay_sample_count = 22000;
 uint16_t delayed_value = 0;
 
 
-uint16_t delay_amplitude = 50;
-uint16_t IIR_enabled = 0;
-uint16_t IIR_amplitude = 10;
+int32_t delay_amplitude = 50;
+int32_t IIR_enabled = 0;
+int32_t IIR_amplitude = 10;
 
 // Delay input buffer
 int16_t input_buffer_data[DELAY_BUFFER_SIZE];       // Actual input buffer data
@@ -185,10 +191,11 @@ sample_buffer input_buffer = {DELAY_BUFFER_SIZE,0,0,input_buffer_data}; // Input
 int16_t output_buffer_data [DELAY_BUFFER_SIZE];     // Actual output buffer data
 sample_buffer output_buffer = {DELAY_BUFFER_SIZE, 0, 0, output_buffer_data}; // Output buffer wrapper
 
-uint16_t delay_enabled = 0;
+int32_t delay_enabled = 0;
 
 sample_buffer* current_sample_buffer_to_input_from = &input_buffer;
-float current_delay_amplitude = calculated_delay_amplitude;
+//float current_delay_amplitude = calculated_delay_amplitude;
+uint16_t current_delay_amplitude;
 
 
 
@@ -205,14 +212,16 @@ float current_delay_amplitude = calculated_delay_amplitude;
 ~  .                        
 ================================================================================= */
 
-uint16_t flanger_enabled = 0;
-uint16_t flanger_min_delay = 0;
-uint16_t flanger_max_delay = 2000;
-uint16_t flanger_period = 1000;
-uint32_t flanger_increment_period = 1000;
+int32_t flanger_enabled = 0;
+int32_t flanger_min_delay = 0;
+int32_t flanger_max_delay = 2000;
+int32_t flanger_period = 10;
+int32_t flanger_increment_period = 10;
 
 bool flanger_climbing = true;
+uint16_t flanger_timer = 0;
 
+/*
 repeating_timer flanger_timer;
 
 bool update_flanger_delay(struct repeating_timer *t)
@@ -232,7 +241,7 @@ bool update_flanger_delay(struct repeating_timer *t)
     return true;
 }
 
-
+*/
 
 
 /* ===========================================================================================
@@ -272,17 +281,17 @@ uint16_t wrap_count(uint16_t count, int32_t increment,uint16_t wrap)
 
 //i2c screen software defines
 #define NO_VARIABLES_ON_SCREEN 7        // Max number of variables on screen
-#define NO_MODIFIABLE_VARIABLES 15      // Number of variables available to modify
+#define NO_MODIFIABLE_VARIABLES 16      // Number of variables available to modify
 #define CURRENT_VARIABLE modifiable_variables[selected_variable]    // Quick access to current selected variable
 #define CURRENT_VALUE *(modifiable_variables[selected_variable].variable_address)   // Quick access to its value
 
-uint16_t variable_display_offset = 0;   // Used to move variables visible on screen
+int16_t variable_display_offset = 0;   // Used to move variables visible on screen
 int16_t selected_variable = 0;          // Variable highlighted / selected to modify
 
 struct modifiable_variable              // Structure to store all parameters of a variable
 {
     char name [16];                     // Display name
-    uint16_t* variable_address;         // Address to actual variable
+    int32_t* variable_address;         // Address to actual variable
     uint16_t min;                       // Minimum value
     uint16_t max;                       // Maximum value
     uint16_t step;                      // Step size
@@ -292,20 +301,22 @@ struct modifiable_variable              // Structure to store all parameters of 
 // All variables available to modify
 modifiable_variable modifiable_variables [NO_MODIFIABLE_VARIABLES]=
 {
+    {"Out Volume", &output_volume,0,255,8,false},
     {"Distortion", &distortion_enabled, 0,1,1,false},
-    {"Dst.Mix",&distortion_mix,0,100,10,false},
+    {"Dst.Mix",&distortion_mix,0,127,8,false},
     {"Dst.Mask",&distortion_mask,0xff00,0xffff,0xff,false},
-    {"PrDly Amp",&pre_delay_amplitude,0,100,10,false},
+    {"PrDly Amp",&pre_delay_amplitude,0,127,8,false},
     {"Dly EN",&delay_enabled,0,1,1,false},
     {"Dly Len",&delay_sample_count,2000,45000,1000,false},
-    {"Dly Amp",&delay_amplitude,0,100,10,false},
+    {"Dly Amp",&delay_amplitude,0,127,8,false},
     {"IIR EN",&IIR_enabled,0,1,1,false},
-    {"IIR Amp",&IIR_amplitude,0,80,10,false},
+    {"IIR Amp",&IIR_amplitude,0,96,8,false},
     {"Flngr EN",&flanger_enabled,0,1,1,false},
     {"Min FDly",&flanger_min_delay,0,3000,100,false},
     {"Max FDly",&flanger_max_delay,0,8000,100,false},
-    {"FlngPrd.",&flanger_period,100,4000,100,false},
-    {"FIncPrd",(uint16_t*)&flanger_increment_period,0,0,0,true},
+    {"FlngPrd.",&flanger_period,1,100,1,false},
+    //{"FIncPrd",(int32_t*)&flanger_increment_period,0,0,0,true},
+    {"Time",&time_taken,0,0,0,true},
     {"Update",&reboot_to_bootlader,0,1,1,false}
 };
 
@@ -340,7 +351,7 @@ void irq_button_callback()
 
         // Disable A to D timer
         cancel_repeating_timer(&timer);
-        cancel_repeating_timer(&flanger_timer);
+        //cancel_repeating_timer(&flanger_timer);
         
         // Empty buffers
         clear_sample_buffer(&input_buffer,0);
@@ -356,24 +367,22 @@ void irq_button_callback()
         {
             if (flanger_max_delay > flanger_min_delay)
             {
-                modifiable_variables[2].read_only = true;
-                modifiable_variables[3].read_only = true;
+                modifiable_variables[5].read_only = true;
+                modifiable_variables[6].read_only = true;
                 delay_sample_count = flanger_min_delay;
                 flanger_climbing = true;
-                flanger_increment_period = (flanger_period * 500) / (flanger_max_delay - flanger_min_delay + 1);
-                add_repeating_timer_us(-1*flanger_increment_period,update_flanger_delay,NULL,&flanger_timer);
             }
             else
             {
-                modifiable_variables[2].read_only = false;
-                modifiable_variables[3].read_only = false;
+                modifiable_variables[5].read_only = false;
+                modifiable_variables[6].read_only = false;
                 flanger_enabled = false;
             }
         }
         else
         {
-            modifiable_variables[2].read_only = false;
-            modifiable_variables[3].read_only = false;
+            modifiable_variables[5].read_only = false;
+            modifiable_variables[6].read_only = false;
         }
         
         // Re-enable A to D timer
@@ -418,10 +427,11 @@ void irq_button_callback()
         selected_variable = (selected_variable + NO_MODIFIABLE_VARIABLES - 1) % NO_MODIFIABLE_VARIABLES;
         
         // Offset displayed variables if selected variable goes off-screen
-        while ((selected_variable - variable_display_offset) >= NO_VARIABLES_ON_SCREEN)
-        {variable_display_offset++;}
-        while (selected_variable - variable_display_offset < 0)
-        {variable_display_offset++;}
+        if ((selected_variable - variable_display_offset) >= NO_VARIABLES_ON_SCREEN)
+        {variable_display_offset = NO_MODIFIABLE_VARIABLES - 1;}
+        else if (selected_variable - variable_display_offset < 0)
+        {variable_display_offset--;}
+
 
         gpio_acknowledge_irq(BUTTON_UP,GPIO_IRQ_EDGE_RISE); // Acknowledge interrupt
         
@@ -435,10 +445,10 @@ void irq_button_callback()
         selected_variable =  (selected_variable + 1) % NO_MODIFIABLE_VARIABLES;
 
         // Offset displayed variables if selected variable goes off-screen
-        while ((selected_variable - variable_display_offset) >= NO_VARIABLES_ON_SCREEN)
+        if ((selected_variable - variable_display_offset) >= NO_VARIABLES_ON_SCREEN)
         {variable_display_offset++;}
-        while (selected_variable - variable_display_offset < 0)
-        {variable_display_offset++;}
+        else if (selected_variable - variable_display_offset < 0)
+        {variable_display_offset = 0;}
 
         gpio_acknowledge_irq(BUTTON_DOWN,GPIO_IRQ_EDGE_RISE); // Acknowledge interrupt
 
@@ -474,22 +484,18 @@ void irq_button_callback()
         {}
     }    
 
-    calculated_distortion_amplitude = distortion_mix * 0.01;
-    calculated_distortion_dry_amplitude = 1 - calculated_distortion_amplitude;
-    calculated_pre_delay_amplitude = pre_delay_amplitude * 0.01;
-    calculated_delay_amplitude = delay_amplitude * 0.01;
-    calculated_IIR_amplitude = IIR_amplitude * 0.01;
+    distortion_dry_amplitude = 128 - distortion_mix;
 
 
     if (IIR_enabled)
     {
         current_sample_buffer_to_input_from = &output_buffer;
-        current_delay_amplitude = calculated_IIR_amplitude;
+        current_delay_amplitude = IIR_amplitude;
     }
     else
     {
         current_sample_buffer_to_input_from = &input_buffer;
-        current_delay_amplitude = calculated_delay_amplitude;
+        current_delay_amplitude = delay_amplitude;
     }
 
 
@@ -552,12 +558,13 @@ void irq_button_callback()
 // Timer callback function, takes timer object as input 
 bool timer_callback(struct repeating_timer *t)
 {
-    
+    time_started = time_us_32();
     // Get input from A -> D
     previous_sample_raw = adc_raw;
     adc_raw = adc_read(); 
-    uint16_t temp_sample = adc_raw;
-    uint16_t distorted_sample;
+    temp_sample = adc_raw;
+    //uint16_t temp_sample = adc_raw;
+    //uint16_t distorted_sample;
 
 
 
@@ -596,10 +603,10 @@ bool timer_callback(struct repeating_timer *t)
         }
 
         //temp_sample = (temp_sample*calculated_distortion_dry_amplitude)+(selected_distortion_map[temp_sample]*calculated_distortion_amplitude);
-        distorted_sample = selected_distortion_map[temp_sample] * calculated_distortion_amplitude;
-        temp_sample = temp_sample * calculated_distortion_dry_amplitude;
+        temp_distorted_sample = (selected_distortion_map[temp_sample] * distortion_mix) >> 7;
+        temp_sample = (temp_sample * distortion_dry_amplitude) >> 7;
         //tight_loop_contents();
-        temp_sample += distorted_sample;
+        temp_sample += temp_distorted_sample;
 
 
         
@@ -622,11 +629,38 @@ bool timer_callback(struct repeating_timer *t)
     //if (input_buffer.in_count != input_buffer.out_count)    // So in theory this should keep the input and
                                                                 // output buffers in sync, apparently it doesnt
     //   {
+
+            if (flanger_enabled)
+            {
+                flanger_timer = (flanger_timer + 1) % flanger_period;
+                if (flanger_timer == 0)
+                {
+                    if (flanger_climbing) 
+                    {
+                        delay_sample_count ++; 
+                        if (delay_sample_count >= flanger_max_delay)
+                        {
+                            flanger_climbing = !flanger_climbing;
+                        }
+                    }
+                    else
+                    {
+                        delay_sample_count --;
+                        if (delay_sample_count <= flanger_min_delay)
+                        {
+                            flanger_climbing = !flanger_climbing;
+                        }
+                    }
+                }
+
+                
+            }
+
             if (delay_enabled)
             {
                 delayed_value = (input_buffer.out_count - delay_sample_count + input_buffer.size ) % input_buffer.size;
-                temp_val = input_buffer.contents[input_buffer.out_count] * calculated_pre_delay_amplitude;
-                temp_val += current_sample_buffer_to_input_from->contents[delayed_value] *  current_delay_amplitude;
+                temp_val = (input_buffer.contents[input_buffer.out_count] * pre_delay_amplitude) >> 7;
+                temp_val += (current_sample_buffer_to_input_from->contents[delayed_value] *  current_delay_amplitude) >> 7;
 
             }
             else
@@ -639,7 +673,8 @@ bool timer_callback(struct repeating_timer *t)
             output_buffer.in_count = input_buffer.in_count;
     //    }
 
-
+    time_ended  = time_us_32();
+    time_taken = time_ended - time_started;
     return true;
 }
 
@@ -661,12 +696,19 @@ bool timer_callback(struct repeating_timer *t)
 
 void pwm_interrupt_callback()
 {
+    pwm_set_gpio_level(PWM_PIN,level);
     pwm_clear_irq(slice);
     if (output_buffer.out_count != output_buffer.in_count)
     {
-        level = ((output_buffer.contents[output_buffer.out_count] + 2048) >> 2) + 175;
-        pwm_set_gpio_level(PWM_PIN,level);
+        level = (
+                    (
+                        ((output_buffer.contents[output_buffer.out_count] * output_volume) >> 7) 
+                        + 2048
+                    )
+                    >> 2) 
+                    + 175;
         output_buffer.out_count = (output_buffer.out_count + 1) % output_buffer.size;
+        //level = (output_volume * level) >> 7;
     }
     
     return;
@@ -685,7 +727,7 @@ void pwm_interrupt_callback()
 ~   | |\/| |/ _` | | '_ \    | || '_ \| | __|
 ~   | |  | | (_| | | | | |  _| || | | | | |_ 
 ~   \_|  |_/\__,_|_|_| |_|  \___/_| |_|_|\__|
-~                                         
+~                                        
 ~                                         
 ======================================================================= */
 
