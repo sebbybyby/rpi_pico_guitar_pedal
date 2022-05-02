@@ -49,7 +49,7 @@
 
 
 #define GPIO_BUTTON_MASK 0x3E0
-#define PROGRAM_VERSION "v01_05_22"
+#define PROGRAM_VERSION "v02_05_22"
 
 // Priority flags for RP2040 interrupts
 #define IRQ_LOW_PRIORITY 0xc0
