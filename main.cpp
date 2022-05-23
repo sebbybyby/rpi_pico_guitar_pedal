@@ -26,7 +26,7 @@
 #include "hardware/irq.h"
 #include "hardware/watchdog.h"
 #include "ssd1306.h"
-#include "include/distortion_map.h"
+#include "include/distortion_map.h"     // Distortion map stored in separate .h file
 #include "pico-ssd1306/textRenderer/TextRenderer.h"
 #include "pico-ssd1306/textRenderer/8x8_font.h"
 #include "pico/float.h"
